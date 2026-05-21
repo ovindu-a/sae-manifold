@@ -1,0 +1,48 @@
+[project]
+name = "sae-manifold-eval"
+version = "0.1.0"
+description = "Evaluation code for 'Do Sparse Autoencoders Capture Concept Manifolds?' — subspace capture metrics and unsupervised feature clustering for SAEs."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+authors = [
+    { name = "Usha Bhalla" },
+    { name = "Thomas Fel" },
+    { name = "Can Rager" },
+    { name = "Sheridan Feucht" },
+    { name = "Tal Haklay" },
+    { name = "Daniel Wurgaft" },
+    { name = "Siddharth Boppana" },
+    { name = "Matthew Kowal" },
+    { name = "Vasudev Shyam" },
+    { name = "Owen Lewis" },
+    { name = "Thomas McGrath" },
+    { name = "Jack Merullo" },
+    { name = "Atticus Geiger" },
+    { name = "Ekdeep Singh Lubana" },
+]
+
+dependencies = [
+    "torch>=2.2",
+    "nnsight>=0.3",
+    "transformers>=4.40",
+    "datasets>=2.18",
+    "numpy>=1.24",
+    "pandas>=2.0",
+    "scipy>=1.11",
+    "scikit-learn>=1.3",
+    "tqdm>=4.65",
+    "matplotlib>=3.7",
+    "seaborn>=0.13",
+    "plotly>=5.18",
+    "python-igraph>=0.11",
+    "leidenalg>=0.10",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+only-include = ["saes.py", "data.py", "background.py", "subspace_capture.py", "unsupervised_clustering.py"]
+sources = ["."]
