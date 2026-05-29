@@ -174,23 +174,77 @@ def find_support_greedy_codes(activations, sae, codes,
 
 # ── Plotting: variance-explained curves ──────────────────────────────────────
 
-def plot_greedy_variance_curves(sae_path, manifolds=None, max_k=64,
-                                out_dir=None, **sae_kwargs):
-    """Plot ``# features`` vs ``variance explained`` for both greedy methods
-    alongside PCA and random baselines (one PDF per manifold).
+# Distinct colors for up to 8 SAEs in the comparison plot.
+_SAE_PALETTE = [
+    '#1f77b4',  # blue
+    '#d62728',  # red
+    '#2ca02c',  # green
+    '#9467bd',  # purple
+    '#8c564b',  # brown
+    '#e377c2',  # pink
+    '#17becf',  # cyan
+    '#bcbd22',  # yellow-green
+]
+
+
+def _infer_sae_label(sae_path):
+    """Read sae_type from checkpoint config; fall back to the filename stem."""
+    try:
+        ckpt = torch.load(sae_path, map_location="cpu", weights_only=False)
+        if isinstance(ckpt, dict):
+            t = ckpt.get("model_config", {}).get("sae_type", "")
+            if t:
+                return t
+    except Exception:
+        pass
+    return Path(sae_path).stem
+
+
+def plot_greedy_variance_curves(sae_paths, sae_labels=None, manifolds=None,
+                                max_k=64, out_dir=None, **sae_kwargs):
+    """Plot variance-explained curves for one or more SAEs on the same axes.
+
+    For each SAE, two curves are drawn:
+      - solid line: geometric greedy (decoder directions)
+      - dashed line: statistical greedy (actual SAE codes)
+
+    Baselines (PCA, random orthogonal, random overcomplete) are computed once
+    per manifold and shown in neutral colors.
+
+    Args:
+        sae_paths: a single path string or a list of path strings
+        sae_labels: optional list of display names (inferred from checkpoint if None)
+        manifolds: list of manifold names to evaluate (default: all)
+        max_k: maximum number of features to select
+        out_dir: directory for output PDFs
+        **sae_kwargs: forwarded to ``load_sae`` (d_in, d_sae, k, …)
     """
     import matplotlib
     matplotlib.use('Agg')
     import matplotlib.pyplot as plt
     import seaborn as sns
 
-    sae = load_sae(sae_path, device=DEVICE, **sae_kwargs)
-    decoder = get_decoder(sae)
+    if isinstance(sae_paths, str):
+        sae_paths = [sae_paths]
+    if sae_labels is None:
+        sae_labels = [_infer_sae_label(p) for p in sae_paths]
 
     out_dir = Path(out_dir) if out_dir else RESULTS_DIR
     out_dir.mkdir(parents=True, exist_ok=True)
 
     names = manifolds or get_all_manifold_names()
+
+    def _avg_curves(curves):
+        if not curves:
+            return np.array([])
+        ml = max(len(v) for v in curves)
+        padded = np.array([
+            np.pad(v, (0, ml - len(v)),
+                   constant_values=v[-1] if len(v) > 0 else 0)
+            for v in curves
+        ])
+        return padded.mean(0)
+
     for manifold in names:
         data = load_manifold_data(manifold)
         if data is None:
@@ -199,34 +253,27 @@ def plot_greedy_variance_curves(sae_path, manifolds=None, max_k=64,
         acts = data['activations']
         acts_np = (acts.float().numpy()
                    if isinstance(acts, torch.Tensor) else acts)
-        codes = encode_sae(sae, acts)
 
         X_c = acts_np - acts_np.mean(0)
+        d = X_c.shape[1]
+
+        # ── Baselines (manifold-specific, SAE-independent) ─────────────────
         pca = PCA(n_components=min(max_k, *X_c.shape)).fit(X_c)
         vc_pca = np.cumsum(pca.explained_variance_ratio_)
 
-        n_active = int((codes > 0).any(0).sum())
-        k_max = min(max_k, n_active)
+        # Use the first SAE's atom count for the overcomplete random baseline.
+        first_sae = load_sae(sae_paths[0], device=DEVICE, **sae_kwargs)
+        n_atoms = get_decoder(first_sae).shape[0]
+        k_max = max_k  # upper bound; tightened per-SAE below
+        del first_sae
 
-        print(f"  {manifold}: geometric reconstruction (decoder directions)...")
-        _, vc_dir, _ = find_support_greedy(
-            acts_np, decoder, max_k=max_k, var_threshold=1.0)
-
-        print(f"  {manifold}: statistical reconstruction (SAE codes)...")
-        _, vc_codes, _ = find_support_greedy_codes(
-            acts_np, sae, codes, max_k=max_k, var_threshold=1.0)
-
-        d = X_c.shape[1]
         n_seeds = 5
-        n_atoms = decoder.shape[0]
-
         print(f"  {manifold}: random orthogonal baseline...")
         vc_orth_list = []
         for seed in range(n_seeds):
             rng = np.random.default_rng(seed)
             Q, _ = np.linalg.qr(rng.standard_normal((d, d)).astype(np.float32))
-            _, vc_r, _ = find_support_greedy(
-                acts_np, Q, max_k=max_k, var_threshold=1.0)
+            _, vc_r, _ = find_support_greedy(acts_np, Q, max_k=max_k, var_threshold=1.0)
             vc_orth_list.append(vc_r[:k_max])
 
         print(f"  {manifold}: random overcomplete baseline...")
@@ -235,27 +282,14 @@ def plot_greedy_variance_curves(sae_path, manifolds=None, max_k=64,
             rng = np.random.default_rng(seed + 100)
             R = rng.standard_normal((n_atoms, d)).astype(np.float32)
             R /= np.linalg.norm(R, axis=1, keepdims=True)
-            _, vc_r, _ = find_support_greedy(
-                acts_np, R, max_k=max_k, var_threshold=1.0)
+            _, vc_r, _ = find_support_greedy(acts_np, R, max_k=max_k, var_threshold=1.0)
             vc_over_list.append(vc_r[:k_max])
-
-        def _avg_curves(curves):
-            if not curves:
-                return np.array([])
-            ml = max(len(v) for v in curves)
-            padded = np.array([
-                np.pad(v, (0, ml - len(v)),
-                       constant_values=v[-1] if len(v) > 0 else 0)
-                for v in curves
-            ])
-            return padded.mean(0)
 
         vc_rand_orth = _avg_curves(vc_orth_list)
         vc_rand_over = _avg_curves(vc_over_list)
 
         eval_ks = sorted(set(
-            [1, 2] + [2**i for i in range(2, 10) if 2**i <= k_max]
-            + [k_max]
+            [1, 2] + [2**i for i in range(2, 10) if 2**i <= k_max] + [k_max]
         ))
 
         def _subsample(curve, ks=eval_ks):
@@ -265,42 +299,59 @@ def plot_greedy_variance_curves(sae_path, manifolds=None, max_k=64,
             return np.array(valid), np.array([curve[k - 1] for k in valid])
 
         sns.set_style('whitegrid', {'grid.color': '#dedede'})
-        fig, ax = plt.subplots(figsize=(8, 4))
+        fig, ax = plt.subplots(figsize=(9, 4))
 
+        # Baselines
         ks_pca, vs_pca = _subsample(vc_pca[:k_max])
-        if len(ks_pca) > 0:
-            ax.plot(ks_pca, vs_pca, linewidth=1.5, color='gray', alpha=0.6,
-                    linestyle='--', label='PCA (optimal)',
-                    marker='o', markersize=3)
-        if len(vc_rand_orth) > 0:
+        if len(ks_pca):
+            ax.plot(ks_pca, vs_pca, lw=1.5, color='gray', alpha=0.6,
+                    ls='--', label='PCA (optimal)', marker='o', ms=3)
+        if len(vc_rand_orth):
             ks_ro, vs_ro = _subsample(vc_rand_orth)
-            ax.plot(ks_ro, vs_ro, linewidth=1.5, color='orange', alpha=0.6,
-                    linestyle=':', label='Random orthogonal',
-                    marker='o', markersize=3)
-        if len(vc_rand_over) > 0:
+            ax.plot(ks_ro, vs_ro, lw=1.5, color='orange', alpha=0.55,
+                    ls=':', label='Random orthogonal', marker='o', ms=3)
+        if len(vc_rand_over):
             ks_rov, vs_rov = _subsample(vc_rand_over)
-            ax.plot(ks_rov, vs_rov, linewidth=1.5, color='green', alpha=0.6,
-                    linestyle=':', label='Random overcomplete',
-                    marker='o', markersize=3)
-        if len(vc_dir) > 0:
-            ks_d, vs_d = _subsample(vc_dir[:k_max])
-            ax.plot(ks_d, vs_d, linewidth=1.5, color='blue', alpha=0.8,
-                    label='Geometric (decoder directions)',
-                    marker='o', markersize=4)
-        if len(vc_codes) > 0:
-            vc = vc_codes[:k_max]
-            if len(vc) < k_max:
-                vc = np.concatenate([vc, np.full(k_max - len(vc), vc[-1])])
-            ks_c, vs_c = _subsample(vc)
-            ax.plot(ks_c, vs_c, linewidth=1.5, color='magenta', alpha=0.8,
-                    label='Statistical (code reconstruction)',
-                    marker='o', markersize=4)
+            ax.plot(ks_rov, vs_rov, lw=1.5, color='saddlebrown', alpha=0.55,
+                    ls=':', label='Random overcomplete', marker='o', ms=3)
+
+        # ── One pair of curves per SAE ─────────────────────────────────────
+        for idx, (sae_path, label) in enumerate(zip(sae_paths, sae_labels)):
+            color = _SAE_PALETTE[idx % len(_SAE_PALETTE)]
+            sae = load_sae(sae_path, device=DEVICE, **sae_kwargs)
+            decoder = get_decoder(sae)
+            codes = encode_sae(sae, acts)
+
+            n_active = int((codes > 0).any(0).sum())
+            sae_k_max = min(max_k, n_active)
+
+            print(f"  {manifold} [{label}]: geometric reconstruction...")
+            _, vc_dir, _ = find_support_greedy(
+                acts_np, decoder, max_k=max_k, var_threshold=1.0)
+
+            print(f"  {manifold} [{label}]: statistical reconstruction...")
+            _, vc_codes, _ = find_support_greedy_codes(
+                acts_np, sae, codes, max_k=max_k, var_threshold=1.0)
+
+            if len(vc_dir):
+                ks_d, vs_d = _subsample(vc_dir[:sae_k_max])
+                ax.plot(ks_d, vs_d, lw=1.8, color=color, alpha=0.9,
+                        ls='-', label=f'{label} geometric',
+                        marker='o', ms=4)
+            if len(vc_codes):
+                vc = vc_codes[:sae_k_max]
+                if len(vc) < sae_k_max:
+                    vc = np.concatenate([vc, np.full(sae_k_max - len(vc), vc[-1])])
+                ks_c, vs_c = _subsample(vc)
+                ax.plot(ks_c, vs_c, lw=1.8, color=color, alpha=0.9,
+                        ls='--', label=f'{label} statistical',
+                        marker='s', ms=4)
 
         ax.set_xlabel('Number of SAE features')
         ax.set_ylabel('Variance explained')
         ax.set_title(f"{manifold.capitalize()} — manifold reconstruction")
         ax.legend(loc='upper left', bbox_to_anchor=(1.02, 1),
-                  borderaxespad=0, frameon=False)
+                  borderaxespad=0, frameon=False, fontsize=8)
         sns.despine()
         fig.tight_layout()
         out_path = out_dir / f"{manifold}_greedy_ve.pdf"
@@ -453,15 +504,15 @@ def plot_tuning_curves(sae_path, manifolds=None, n_features=10, sigma=3,
 # ── CLI ──────────────────────────────────────────────────────────────────────
 
 def _add_sae_args(parser):
-    parser.add_argument('--sae', type=str, required=True,
-                        help='Path to SAE checkpoint')
+    parser.add_argument('--sae', type=str, nargs='+', required=True,
+                        help='Path(s) to SAE checkpoint(s)')
     parser.add_argument('--d-in', type=int, default=D_MODEL)
     parser.add_argument('--d-sae', type=int, default=None,
                         help='SAE width; inferred from checkpoint if absent')
     parser.add_argument('--expansion-factor', type=int, default=None,
                         help='Alternative to --d-sae (d_sae = d_in * factor)')
     parser.add_argument('--k', type=int, default=None,
-                        help='BatchTopK sparsity')
+                        help='Sparsity k; inferred from checkpoint if absent')
 
 
 def _sae_kwargs(a):
@@ -479,6 +530,8 @@ def main():
     plot_p = sub.add_parser('plot',
                             help='VE curves: geometric vs. statistical greedy + PCA/random baselines')
     _add_sae_args(plot_p)
+    plot_p.add_argument('--sae-labels', nargs='*', default=None,
+                        help='Display labels for each SAE (default: inferred from checkpoint)')
     plot_p.add_argument('--manifold', nargs='*', default=None)
     plot_p.add_argument('--max-k', type=int, default=64)
     plot_p.add_argument('--out-dir', type=str, default=None)
@@ -497,11 +550,16 @@ def main():
     a = p.parse_args()
     if a.command == 'plot':
         plot_greedy_variance_curves(
-            a.sae, manifolds=a.manifold, max_k=a.max_k,
+            a.sae, sae_labels=a.sae_labels,
+            manifolds=a.manifold, max_k=a.max_k,
             out_dir=a.out_dir, **_sae_kwargs(a))
     elif a.command == 'tuning':
+        # tuning works with a single SAE; use the first if multiple are given.
+        sae_path = a.sae[0]
+        if len(a.sae) > 1:
+            print(f"Warning: tuning only uses the first SAE ({sae_path})")
         plot_tuning_curves(
-            a.sae, manifolds=a.manifold,
+            sae_path, manifolds=a.manifold,
             n_features=a.n_features, sigma=a.sigma,
             out_dir=a.out_dir,
             label_range=tuple(a.label_range) if a.label_range else None,

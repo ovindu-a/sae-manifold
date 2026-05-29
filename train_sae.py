@@ -18,11 +18,12 @@ from pathlib import Path
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from torch import nn
 from torch.utils.data import DataLoader, TensorDataset, random_split
 
 from data import CACHE_DIR, get_all_manifold_names, load_manifold_data
-from saes import BatchTopKSAE
+from saes import BatchTopKSAE, GatedSAE, JumpReLUSAE, MatryoshkaSAE
 
 
 def _load_training_activations(manifolds, filter_outliers=True, n_std=3.0):
@@ -65,16 +66,24 @@ def _make_loaders(activations, batch_size, val_fraction, seed):
     return train_loader, val_loader
 
 
-def _init_model(d_in, d_sae, k, device, dtype):
-    model = BatchTopKSAE(d_in=d_in, d_sae=d_sae, k=k, device=device, dtype=dtype)
-    if model.encoder.bias is not None:
-        nn.init.zeros_(model.encoder.bias)
-    if model.decoder.bias is not None:
-        nn.init.zeros_(model.decoder.bias)
+def _init_model(sae_type, d_in, d_sae, k, ks, device, dtype):
+    if sae_type == "gated":
+        model = GatedSAE(d_in=d_in, d_sae=d_sae, device=device, dtype=dtype)
+    elif sae_type == "jumprelu":
+        model = JumpReLUSAE(d_in=d_in, d_sae=d_sae, device=device, dtype=dtype)
+    elif sae_type == "matryoshka":
+        if ks is None:
+            ks = [max(1, k // 4), k // 2, k]
+        model = MatryoshkaSAE(d_in=d_in, d_sae=d_sae, ks=ks, device=device, dtype=dtype)
+    else:
+        model = BatchTopKSAE(d_in=d_in, d_sae=d_sae, k=k, device=device, dtype=dtype)
+    for m in model.modules():
+        if isinstance(m, nn.Linear) and m.bias is not None:
+            nn.init.zeros_(m.bias)
     return model
 
 
-def _run_epoch(model, loader, optimizer=None, device="cpu"):
+def _run_epoch(model, loader, optimizer=None, device="cpu", l1_weight=0.0):
     training = optimizer is not None
     model.train(training)
     total_loss = 0.0
@@ -84,25 +93,64 @@ def _run_epoch(model, loader, optimizer=None, device="cpu"):
         batch = batch.to(device=device)
         if training:
             optimizer.zero_grad(set_to_none=True)
-        recon, _ = model(batch)
-        loss = torch.nn.functional.mse_loss(recon, batch)
+
+        if isinstance(model, MatryoshkaSAE):
+            # Average reconstruction loss across all k levels.
+            recons = model.forward_all_k(batch)
+            loss = sum(F.mse_loss(r, batch) for r in recons) / len(recons)
+        else:
+            recon, z = model(batch)
+            loss = F.mse_loss(recon, batch)
+            if l1_weight > 0:
+                loss = loss + l1_weight * z.abs().mean()
+
         if training:
             loss.backward()
             optimizer.step()
 
-        batch_size = batch.shape[0]
-        total_loss += float(loss.detach()) * batch_size
-        total_examples += batch_size
+        total_loss += float(loss.detach()) * batch.shape[0]
+        total_examples += batch.shape[0]
 
     return total_loss / max(total_examples, 1)
+
+
+@torch.no_grad()
+def _fit_jumprelu_thresholds(model, train_loader, target_k, device):
+    """Set per-feature thresholds so average L0 ≈ target_k on training data."""
+    model.eval()
+    pres = []
+    for (batch,) in train_loader:
+        pre = F.relu(model.encoder(batch.to(device)))
+        pres.append(pre.cpu().float())
+    pre_all = torch.cat(pres, dim=0).numpy()  # [N, d_sae]
+
+    # For each feature, find the threshold that keeps (target_k / d_sae) of
+    # all samples active — i.e. the (1 - target_rate) quantile of pre-activations.
+    target_rate = float(target_k) / model.d_sae
+    thresholds = np.zeros(model.d_sae, dtype=np.float32)
+    for i in range(model.d_sae):
+        t = float(np.quantile(pre_all[:, i], 1.0 - target_rate))
+        thresholds[i] = max(t, 0.0)  # pre is already ≥ 0 after ReLU
+    model.threshold.copy_(torch.from_numpy(thresholds))
+
+    total_fires = total_n = 0
+    for (batch,) in train_loader:
+        z = model.encode(batch.to(device))
+        total_fires += (z > 0).float().sum().item()
+        total_n += batch.shape[0]
+    print(f"  JumpReLU thresholds set: avg L0={total_fires / max(total_n, 1):.1f} "
+          f"(target {target_k})")
 
 
 def train_sae(
     manifolds=None,
     output_path="cache/sae.pt",
+    sae_type="batchtopk",
     d_sae=None,
     expansion_factor=4.0,
     k=64,
+    matryoshka_ks=None,
+    l1_weight=0.0,
     batch_size=256,
     epochs=20,
     lr=3e-4,
@@ -128,20 +176,27 @@ def train_sae(
         d_sae = int(round(d_in * expansion_factor))
 
     train_loader, val_loader = _make_loaders(activations, batch_size, val_fraction, seed)
-    model = _init_model(d_in=d_in, d_sae=d_sae, k=k, device=device, dtype=dtype)
+    model = _init_model(sae_type=sae_type, d_in=d_in, d_sae=d_sae, k=k,
+                        ks=matryoshka_ks, device=device, dtype=dtype)
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
 
+    ks_actual = model.ks if isinstance(model, MatryoshkaSAE) else None
     print(f"Training on manifolds: {', '.join(selected_manifolds)}")
     print(f"Activations: {tuple(activations.shape)}")
-    print(f"SAE: d_in={d_in}, d_sae={d_sae}, k={k}, device={device}, dtype={dtype}")
+    print(f"SAE type: {sae_type} | d_in={d_in}, d_sae={d_sae}, k={k}"
+          + (f", ks={ks_actual}" if ks_actual else "")
+          + (f", l1={l1_weight}" if l1_weight > 0 else "")
+          + f" | device={device}, dtype={dtype}")
 
     history = []
     best_val = float('inf')
     best_state = None
 
     for epoch in range(1, epochs + 1):
-        train_loss = _run_epoch(model, train_loader, optimizer=optimizer, device=device)
-        val_loss = _run_epoch(model, val_loader, optimizer=None, device=device) if val_loader else None
+        train_loss = _run_epoch(model, train_loader, optimizer=optimizer,
+                                device=device, l1_weight=l1_weight)
+        val_loss = (_run_epoch(model, val_loader, device=device)
+                    if val_loader else None)
         history.append(dict(epoch=epoch, train_loss=train_loss, val_loss=val_loss))
 
         if val_loss is None:
@@ -150,19 +205,29 @@ def train_sae(
             print(f"Epoch {epoch:03d}: train_loss={train_loss:.6f} val_loss={val_loss:.6f}")
             if val_loss < best_val:
                 best_val = val_loss
-                best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+                best_state = {_k: v.detach().cpu().clone()
+                              for _k, v in model.state_dict().items()}
 
     if best_state is not None:
         model.load_state_dict(best_state)
+
+    # JumpReLU: fit per-feature thresholds on training data after finding the
+    # best weights.  Thresholds are stored in the buffer so they are part of
+    # the saved state_dict.
+    if sae_type == "jumprelu":
+        print("Fitting JumpReLU thresholds...")
+        _fit_jumprelu_thresholds(model, train_loader, target_k=k, device=device)
 
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     checkpoint = {
         "state_dict": model.state_dict(),
         "model_config": {
+            "sae_type": sae_type,
             "d_in": d_in,
             "d_sae": d_sae,
             "k": k,
+            "ks": ks_actual,
             "expansion_factor": float(d_sae) / float(d_in),
             "manifolds": selected_manifolds,
             "filter_outliers": filter_outliers,
@@ -172,6 +237,7 @@ def train_sae(
             "batch_size": batch_size,
             "epochs": epochs,
             "lr": lr,
+            "l1_weight": l1_weight,
             "weight_decay": weight_decay,
             "val_fraction": val_fraction,
             "seed": seed,
@@ -200,6 +266,13 @@ def main():
         help="Path to write the SAE checkpoint",
     )
     parser.add_argument(
+        "--sae-type",
+        type=str,
+        default="batchtopk",
+        choices=["batchtopk", "gated", "jumprelu", "matryoshka"],
+        help="SAE architecture to train (default: batchtopk)",
+    )
+    parser.add_argument(
         "--d-sae",
         type=int,
         default=None,
@@ -211,7 +284,25 @@ def main():
         default=4.0,
         help="Feature expansion factor used when --d-sae is not set",
     )
-    parser.add_argument("--k", type=int, default=64, help="Inference-time sparsity")
+    parser.add_argument(
+        "--k",
+        type=int,
+        default=64,
+        help="Target sparsity: top-k for batchtopk/matryoshka, target L0 for jumprelu",
+    )
+    parser.add_argument(
+        "--matryoshka-ks",
+        type=int,
+        nargs="+",
+        default=None,
+        help="k levels for matryoshka training (default: [k//4, k//2, k])",
+    )
+    parser.add_argument(
+        "--l1-weight",
+        type=float,
+        default=0.0,
+        help="L1 sparsity penalty weight (recommended for gated and jumprelu types)",
+    )
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--lr", type=float, default=3e-4)
@@ -244,9 +335,12 @@ def main():
     train_sae(
         manifolds=args.manifold,
         output_path=args.output,
+        sae_type=args.sae_type,
         d_sae=args.d_sae,
         expansion_factor=args.expansion_factor,
         k=args.k,
+        matryoshka_ks=args.matryoshka_ks,
+        l1_weight=args.l1_weight,
         batch_size=args.batch_size,
         epochs=args.epochs,
         lr=args.lr,

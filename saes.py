@@ -71,53 +71,172 @@ class BatchTopKSAE(nn.Module):
         return self.decode(z), z
 
 
+class GatedSAE(nn.Module):
+    """Gated SAE: separate linear maps for binary gate and activation magnitude.
+
+    The gate decides which features fire; the magnitude controls how strongly.
+    During training a straight-through estimator (STE) keeps the gate
+    differentiable. At inference the gate is a hard threshold at zero.
+    """
+    def __init__(self, d_in, d_sae, device=None, dtype=torch.float32):
+        super().__init__()
+        self.d_in = d_in
+        self.d_sae = d_sae
+        self.W_gate = nn.Linear(d_in, d_sae)
+        self.W_mag = nn.Linear(d_in, d_sae)
+        self.decoder = nn.Linear(d_sae, d_in)
+        if device is not None or dtype is not None:
+            self.to(device=device, dtype=dtype)
+
+    def encode(self, x):
+        gate = (self.W_gate(x) > 0).float()
+        return gate * F.relu(self.W_mag(x))
+
+    def decode(self, z):
+        return self.decoder(z)
+
+    def forward(self, x):
+        pre_gate = self.W_gate(x)
+        mag = F.relu(self.W_mag(x))
+        soft = torch.sigmoid(pre_gate)
+        gate = (pre_gate > 0).float() + (soft - soft.detach())  # STE
+        z = gate * mag
+        return self.decoder(z), z
+
+
+class JumpReLUSAE(nn.Module):
+    """JumpReLU SAE: ReLU encoder with a per-feature activation threshold.
+
+    The threshold buffer starts at zero and is fitted post-training (by
+    ``train_sae.py``) so average L0 matches a target sparsity. At inference
+    features only fire when their pre-activation exceeds their threshold.
+    """
+    def __init__(self, d_in, d_sae, device=None, dtype=torch.float32):
+        super().__init__()
+        self.d_in = d_in
+        self.d_sae = d_sae
+        self.encoder = nn.Linear(d_in, d_sae)
+        self.decoder = nn.Linear(d_sae, d_in)
+        self.register_buffer("threshold", torch.zeros(d_sae))
+        if device is not None or dtype is not None:
+            self.to(device=device, dtype=dtype)
+
+    def encode(self, x):
+        pre = F.relu(self.encoder(x))
+        return torch.where(pre > self.threshold, pre, torch.zeros_like(pre))
+
+    def decode(self, z):
+        return self.decoder(z)
+
+    def forward(self, x):
+        pre = F.relu(self.encoder(x))
+        z = torch.where(pre > self.threshold, pre, torch.zeros_like(pre))
+        return self.decoder(z), z
+
+
+class MatryoshkaSAE(nn.Module):
+    """Matryoshka SAE: shared decoder trained simultaneously at multiple k levels.
+
+    The reconstruction loss is averaged over all k levels during training.
+    At inference ``self.k`` (the largest k) is used; set ``sae.k`` before
+    calling ``encode`` to evaluate at a coarser resolution.
+    """
+    def __init__(self, d_in, d_sae, ks, device=None, dtype=torch.float32):
+        super().__init__()
+        self.d_in = d_in
+        self.d_sae = d_sae
+        self.ks = sorted(ks)
+        self.k = self.ks[-1]
+        self.encoder = nn.Linear(d_in, d_sae)
+        self.decoder = nn.Linear(d_sae, d_in)
+        if device is not None or dtype is not None:
+            self.to(device=device, dtype=dtype)
+
+    def encode(self, x):
+        pre = F.relu(self.encoder(x))
+        top = pre.topk(self.k, dim=-1)
+        z = torch.zeros_like(pre)
+        z.scatter_(-1, top.indices, top.values)
+        return z
+
+    def decode(self, z):
+        return self.decoder(z)
+
+    def forward(self, x):
+        z = self.encode(x)
+        return self.decoder(z), z
+
+    def forward_all_k(self, x):
+        """Return a list of reconstructions, one per k in ``self.ks``."""
+        pre = F.relu(self.encoder(x))
+        recons = []
+        for k in self.ks:
+            top = pre.topk(k, dim=-1)
+            z = torch.zeros_like(pre)
+            z.scatter_(-1, top.indices, top.values)
+            recons.append(self.decoder(z))
+        return recons
+
+
 def load_sae(path, d_in=4096, d_sae=None, k=None, expansion_factor=None,
              device=None, dtype=torch.float32):
-    """Load a BatchTopK SAE checkpoint.
+    """Load an SAE checkpoint of any supported type.
 
-    Accepts either a raw ``state_dict`` (as produced by
-    ``torch.save(sae.state_dict(), ...)``) or a dict containing a
-    ``state_dict`` key alongside a ``model_config`` dict with ``d_in``,
-    ``d_sae`` (or ``expansion_factor``), and ``k``.
+    Accepts either a raw ``state_dict`` or a dict with ``state_dict`` and
+    ``model_config`` keys. The config may carry ``sae_type`` (one of
+    ``batchtopk``, ``gated``, ``jumprelu``, ``matryoshka``) plus the usual
+    architecture parameters.
 
     Args:
         path: path to the checkpoint
         d_in: model activation dim (default: 4096 for Llama-3.1-8B)
         d_sae: explicit SAE width (if not in checkpoint config)
-        k: sparsity (if not in checkpoint config)
+        k: sparsity / target L0 (if not in checkpoint config)
         expansion_factor: alternative to ``d_sae`` (``d_sae = d_in * factor``)
         device: optional torch device
         dtype: parameter dtype
     """
     ckpt = torch.load(path, map_location="cpu", weights_only=False)
 
-    # Two checkpoint layouts: bare state_dict, or {"state_dict": ..., "model_config": ...}.
+    sae_type = "batchtopk"
+    ks = None
     if isinstance(ckpt, dict) and "state_dict" in ckpt:
         state_dict = ckpt["state_dict"]
         cfg = ckpt.get("model_config", ckpt.get("config", {}))
         d_in = cfg.get("d_in", d_in)
         d_sae = cfg.get("d_sae", d_sae)
         k = cfg.get("k", cfg.get("target_l0", k))
+        sae_type = cfg.get("sae_type", "batchtopk")
+        ks = cfg.get("ks", None)
         if d_sae is None and "expansion_factor" in cfg:
             expansion_factor = cfg["expansion_factor"]
     else:
         state_dict = ckpt
 
     if d_sae is None:
-        if expansion_factor is None:
-            # Infer from encoder weight shape.
-            for key in ("encoder.weight", "encoder_linear.weight", "W_enc"):
+        if expansion_factor is not None:
+            d_sae = int(d_in * expansion_factor)
+        else:
+            for key in ("encoder.weight", "encoder_linear.weight", "W_enc",
+                        "W_gate.weight"):
                 if key in state_dict:
                     d_sae = state_dict[key].shape[0]
                     break
-        else:
-            d_sae = d_in * expansion_factor
     if d_sae is None:
         raise ValueError("Could not infer d_sae; pass d_sae=... or expansion_factor=...")
-    if k is None:
-        raise ValueError("Could not infer k; pass k=...")
 
-    sae = BatchTopKSAE(d_in=d_in, d_sae=d_sae, k=k, device=device, dtype=dtype)
+    if sae_type == "gated":
+        sae = GatedSAE(d_in=d_in, d_sae=d_sae, device=device, dtype=dtype)
+    elif sae_type == "jumprelu":
+        sae = JumpReLUSAE(d_in=d_in, d_sae=d_sae, device=device, dtype=dtype)
+    elif sae_type == "matryoshka":
+        if ks is None:
+            ks = [max(1, k // 4), k // 2, k] if k else [16, 32, 64]
+        sae = MatryoshkaSAE(d_in=d_in, d_sae=d_sae, ks=ks, device=device, dtype=dtype)
+    else:
+        if k is None:
+            raise ValueError("Could not infer k; pass k=...")
+        sae = BatchTopKSAE(d_in=d_in, d_sae=d_sae, k=k, device=device, dtype=dtype)
 
     # Rename legacy keys ("encoder_linear" / "decoder_linear" → "encoder" / "decoder").
     renamed = {}
