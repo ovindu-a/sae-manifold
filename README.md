@@ -37,37 +37,89 @@ uv run data.py --manifold colors  # or just one
 
 Cached activations live in `cache/{manifold}.pt`.
 
-### 1b. Train an SAE on cached activations
+### 2. Train SAEs
+
+Train all four SAE architectures in one command. Checkpoints are saved to
+`cache/saes/{type}.pt`.
 
 ```bash
-uv run train_sae.py --manifold colors --output cache/colors_sae.pt
+uv run train_sae.py
 ```
 
-What the script does, step by step:
+This trains `batchtopk`, `gated`, `jumprelu`, and `matryoshka` sequentially
+with default hyperparameters (k=64, 20 epochs, expansion factor 4×).
 
-1. It loads one or more cached manifold files from `cache/{manifold}.pt`.
-2. It concatenates their `activations` tensors into a training set.
-3. It trains `saes.BatchTopKSAE` with a reconstruction loss on those cached activations.
-4. It saves a checkpoint containing `state_dict` plus `model_config`, which `saes.load_sae` can reload directly.
+**Train a subset of types:**
+```bash
+uv run train_sae.py --sae-type batchtopk matryoshka
+```
 
-By default the script trains on all shipped manifolds that already have cache files. Pass `--manifold colors years` to restrict training to specific caches, or set `--d-sae` if you want an explicit SAE width instead of the default `d_in * 4` expansion.
+**Common overrides:**
+```bash
+uv run train_sae.py \
+    --sae-type batchtopk gated jumprelu matryoshka \
+    --k 64 \
+    --epochs 20 \
+    --output-dir cache/saes
+```
 
-### 2. Run subspace-capture experiments
+| Flag | Default | Description |
+|---|---|---|
+| `--sae-type` | all four | Space-separated list of types to train |
+| `--output-dir` | `cache/saes/` | Where to write `{type}.pt` checkpoints |
+| `--k` | `64` | Target sparsity (top-k for BatchTopK/Matryoshka, target L0 for JumpReLU) |
+| `--matryoshka-ks` | `[k//4, k//2, k]` | k levels for Matryoshka multi-resolution loss |
+| `--l1-weight` | `1e-3` for gated/jumprelu, else `0` | L1 sparsity penalty |
+| `--manifold` | all | Restrict training data to specific manifolds |
+| `--epochs` | `20` | Training epochs per SAE |
+| `--output-dir` | `cache/saes/` | Checkpoint directory |
+
+### 3. Run subspace-capture experiments
+
+#### Compare all SAEs (auto-discovers `cache/saes/*.pt`)
 
 ```bash
-# Variance-explained curves: geometric vs. statistical greedy + PCA / random
-# baselines (Fig. 4 of the paper). One PDF per manifold.
-uv run subspace_capture.py plot --sae /path/to/sae.pt --k 64
-
-# Feature tuning curves: label (x) vs. activation (y) for the top features
-# from the statistical-reconstruction greedy (Fig. 5 / years_recon).
-uv run subspace_capture.py tuning --sae /path/to/sae.pt --k 64 --manifold years
+uv run subspace_capture.py plot
 ```
 
-The `--k` flag is the BatchTopK sparsity. If your checkpoint stores `k` in
-its model config you can omit it.
+Produces one PDF per manifold in `cache/subspace_capture/`, with all four
+SAEs overlaid. Each SAE gets a distinct colour; solid line = geometric greedy
+(decoder directions), dashed line = statistical greedy (actual SAE codes).
+PCA and random baselines are shown for reference.
 
-### 3. Run unsupervised clustering
+#### Exclude specific SAEs
+
+```bash
+uv run subspace_capture.py plot --ignore gated jumprelu
+```
+
+#### Use a custom checkpoint folder or explicit paths
+
+```bash
+# Point at a different folder
+uv run subspace_capture.py plot --sae-dir cache/experiment_1
+
+# Explicit paths (original behaviour)
+uv run subspace_capture.py plot \
+    --sae cache/saes/batchtopk.pt cache/saes/matryoshka.pt
+
+# Custom display labels
+uv run subspace_capture.py plot \
+    --sae cache/saes/batchtopk.pt cache/saes/gated.pt \
+    --sae-labels "BatchTopK" "Gated"
+```
+
+#### Feature tuning curves
+
+```bash
+# Uses the first discovered SAE by default
+uv run subspace_capture.py tuning --manifold years
+
+# Or pick one explicitly
+uv run subspace_capture.py tuning --sae cache/saes/batchtopk.pt --manifold years
+```
+
+### 4. Run unsupervised clustering
 
 ```bash
 # (a) Extract background activations from a streaming text dataset.
@@ -76,16 +128,27 @@ uv run background.py --n-tokens 500000
 # (b) Compute all five similarity matrices (cosine, coactivation,
 #     correlation, MI, Ising).
 uv run unsupervised_clustering.py matrices \
-    --sae /path/to/sae.pt --k 64 --n-tokens 500000
+    --sae cache/saes/batchtopk.pt --n-tokens 500000
 
 # (c) Cluster features. Ising is recommended (Sec. 5 of the paper).
-uv run unsupervised_clustering.py cluster --sae /path/to/sae.pt --matrix ising --method leiden
+uv run unsupervised_clustering.py cluster \
+    --sae cache/saes/batchtopk.pt --matrix ising --method leiden
 
 # Optional: refit Ising with a tuned alpha or on a feature subset.
-uv run unsupervised_clustering.py ising --sae /path/to/sae.pt --k 64 --alpha 0.005
+uv run unsupervised_clustering.py ising \
+    --sae cache/saes/batchtopk.pt --alpha 0.005
 
 # Optional: heatmap of a specific feature subset across all matrices.
-uv run unsupervised_clustering.py heatmap --sae /path/to/sae.pt --features 100 200 300 400
+uv run unsupervised_clustering.py heatmap \
+    --sae cache/saes/batchtopk.pt --features 100 200 300 400
+```
+
+### Full pipeline — minimal commands
+
+```bash
+uv run data.py                       # 1. extract manifold activations
+uv run train_sae.py                  # 2. train all four SAE types → cache/saes/
+uv run subspace_capture.py plot      # 3. comparison chart → cache/subspace_capture/
 ```
 
 ## Manifolds shipped

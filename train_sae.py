@@ -251,6 +251,10 @@ def train_sae(
     return output_path
 
 
+_ALL_SAE_TYPES = ["batchtopk", "gated", "jumprelu", "matryoshka"]
+_L1_DEFAULTS = {"gated": 1e-3, "jumprelu": 1e-3}
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -260,17 +264,20 @@ def main():
         help="Cached manifolds to train on (default: all shipped manifolds with caches)",
     )
     parser.add_argument(
-        "--output",
+        "--output-dir",
         type=str,
-        default="cache/sae.pt",
-        help="Path to write the SAE checkpoint",
+        default="cache/saes",
+        help="Directory to write checkpoints; each type saved as {type}.pt (default: cache/saes/)",
     )
     parser.add_argument(
         "--sae-type",
-        type=str,
-        default="batchtopk",
-        choices=["batchtopk", "gated", "jumprelu", "matryoshka"],
-        help="SAE architecture to train (default: batchtopk)",
+        nargs="+",
+        default=_ALL_SAE_TYPES,
+        metavar="TYPE",
+        help=(
+            "One or more SAE types to train: batchtopk gated jumprelu matryoshka. "
+            "Default: all four."
+        ),
     )
     parser.add_argument(
         "--d-sae",
@@ -300,8 +307,11 @@ def main():
     parser.add_argument(
         "--l1-weight",
         type=float,
-        default=0.0,
-        help="L1 sparsity penalty weight (recommended for gated and jumprelu types)",
+        default=None,
+        help=(
+            "L1 sparsity penalty weight. "
+            "Defaults to 1e-3 for gated/jumprelu, 0 otherwise."
+        ),
     )
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--epochs", type=int, default=20)
@@ -332,26 +342,38 @@ def main():
     args = parser.parse_args()
     dtype = torch.float32 if args.dtype == "float32" else torch.bfloat16
 
-    train_sae(
-        manifolds=args.manifold,
-        output_path=args.output,
-        sae_type=args.sae_type,
-        d_sae=args.d_sae,
-        expansion_factor=args.expansion_factor,
-        k=args.k,
-        matryoshka_ks=args.matryoshka_ks,
-        l1_weight=args.l1_weight,
-        batch_size=args.batch_size,
-        epochs=args.epochs,
-        lr=args.lr,
-        weight_decay=args.weight_decay,
-        val_fraction=args.val_fraction,
-        seed=args.seed,
-        device=args.device,
-        dtype=dtype,
-        filter_outliers=not args.no_filter_outliers,
-        n_std=args.n_std,
-    )
+    unknown = [t for t in args.sae_type if t not in _ALL_SAE_TYPES]
+    if unknown:
+        parser.error(f"Unknown SAE type(s): {unknown}. Choose from {_ALL_SAE_TYPES}")
+
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    for sae_type in args.sae_type:
+        output_path = output_dir / f"{sae_type}.pt"
+        l1_weight = (args.l1_weight if args.l1_weight is not None
+                     else _L1_DEFAULTS.get(sae_type, 0.0))
+        print(f"\n{'='*60}\nTraining {sae_type}  →  {output_path}\n{'='*60}")
+        train_sae(
+            manifolds=args.manifold,
+            output_path=str(output_path),
+            sae_type=sae_type,
+            d_sae=args.d_sae,
+            expansion_factor=args.expansion_factor,
+            k=args.k,
+            matryoshka_ks=args.matryoshka_ks,
+            l1_weight=l1_weight,
+            batch_size=args.batch_size,
+            epochs=args.epochs,
+            lr=args.lr,
+            weight_decay=args.weight_decay,
+            val_fraction=args.val_fraction,
+            seed=args.seed,
+            device=args.device,
+            dtype=dtype,
+            filter_outliers=not args.no_filter_outliers,
+            n_std=args.n_std,
+        )
 
 
 if __name__ == "__main__":

@@ -503,9 +503,44 @@ def plot_tuning_curves(sae_path, manifolds=None, n_features=10, sigma=3,
 
 # ── CLI ──────────────────────────────────────────────────────────────────────
 
+_DEFAULT_SAE_DIR = CACHE_DIR / "saes"
+
+
+def _discover_saes(sae_dir, ignore=None):
+    """Return sorted list of .pt paths in sae_dir, excluding ignored stems."""
+    ignore = set(ignore or [])
+    paths = sorted(Path(sae_dir).glob("*.pt"))
+    kept = [str(p) for p in paths if p.stem not in ignore]
+    if not kept:
+        raise FileNotFoundError(
+            f"No .pt checkpoints found in {sae_dir}. "
+            "Run: uv run train_sae.py"
+        )
+    return kept
+
+
+def _resolve_sae_paths(explicit, sae_dir, ignore):
+    """Resolve the final list of SAE paths from explicit args + discovery."""
+    ignore = set(ignore or [])
+    if explicit:
+        return [p for p in explicit if Path(p).stem not in ignore]
+    return _discover_saes(sae_dir, ignore)
+
+
 def _add_sae_args(parser):
-    parser.add_argument('--sae', type=str, nargs='+', required=True,
-                        help='Path(s) to SAE checkpoint(s)')
+    parser.add_argument(
+        '--sae', type=str, nargs='*', default=None,
+        help='SAE checkpoint path(s). If omitted, all .pt files in --sae-dir are used.',
+    )
+    parser.add_argument(
+        '--sae-dir', type=str, default=str(_DEFAULT_SAE_DIR),
+        help='Directory to auto-discover checkpoints from (default: cache/saes/)',
+    )
+    parser.add_argument(
+        '--ignore', type=str, nargs='*', default=None,
+        metavar='NAME',
+        help='SAE names (file stems) to exclude, e.g. --ignore gated jumprelu',
+    )
     parser.add_argument('--d-in', type=int, default=D_MODEL)
     parser.add_argument('--d-sae', type=int, default=None,
                         help='SAE width; inferred from checkpoint if absent')
@@ -549,15 +584,18 @@ def main():
 
     a = p.parse_args()
     if a.command == 'plot':
+        sae_paths = _resolve_sae_paths(a.sae, a.sae_dir, a.ignore)
+        print(f"SAEs to compare: {[Path(p).stem for p in sae_paths]}")
         plot_greedy_variance_curves(
-            a.sae, sae_labels=a.sae_labels,
+            sae_paths, sae_labels=a.sae_labels,
             manifolds=a.manifold, max_k=a.max_k,
             out_dir=a.out_dir, **_sae_kwargs(a))
     elif a.command == 'tuning':
-        # tuning works with a single SAE; use the first if multiple are given.
-        sae_path = a.sae[0]
-        if len(a.sae) > 1:
-            print(f"Warning: tuning only uses the first SAE ({sae_path})")
+        sae_paths = _resolve_sae_paths(a.sae, a.sae_dir, a.ignore)
+        sae_path = sae_paths[0]
+        if len(sae_paths) > 1:
+            print(f"Note: tuning uses the first SAE ({Path(sae_path).stem}). "
+                  "Pass --sae explicitly to choose a different one.")
         plot_tuning_curves(
             sae_path, manifolds=a.manifold,
             n_features=a.n_features, sigma=a.sigma,
