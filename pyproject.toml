@@ -37,6 +37,8 @@ dependencies = [
     "plotly>=5.18",
     "python-igraph>=0.11",
     "leidenalg>=0.10",
+    "huggingface-hub>=1.17.0",
+    "hf>=1.17.0",
 ]
 
 [build-system]

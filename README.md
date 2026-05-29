@@ -37,6 +37,21 @@ uv run data.py --manifold colors  # or just one
 
 Cached activations live in `cache/{manifold}.pt`.
 
+### 1b. Train an SAE on cached activations
+
+```bash
+uv run train_sae.py --manifold colors --output cache/colors_sae.pt
+```
+
+What the script does, step by step:
+
+1. It loads one or more cached manifold files from `cache/{manifold}.pt`.
+2. It concatenates their `activations` tensors into a training set.
+3. It trains `saes.BatchTopKSAE` with a reconstruction loss on those cached activations.
+4. It saves a checkpoint containing `state_dict` plus `model_config`, which `saes.load_sae` can reload directly.
+
+By default the script trains on all shipped manifolds that already have cache files. Pass `--manifold colors years` to restrict training to specific caches, or set `--d-sae` if you want an explicit SAE width instead of the default `d_in * 4` expansion.
+
 ### 2. Run subspace-capture experiments
 
 ```bash
