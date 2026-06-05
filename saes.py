@@ -123,7 +123,7 @@ class JumpReLUSAE(nn.Module):
 
     def encode(self, x):
         pre = F.relu(self.encoder(x))
-        return torch.where(pre > self.threshold, pre, torch.zeros_like(pre)) # won't activations that are always below threshold get pruned during training?
+        return torch.where(pre > self.threshold, pre, torch.zeros_like(pre))  # won't activations that are always below threshold get pruned during training?
     
 
     def decode(self, z):
@@ -179,14 +179,114 @@ class MatryoshkaSAE(nn.Module):
         return recons
 
 
+class SubspaceSAE(nn.Module):
+    """SAE with dedicated features whose decoder directions are fixed to provided concept vectors.
+
+    The first ``n_dirs`` features are "pinned": their decoder directions are set to
+    the provided directions at construction time and never updated by the optimiser.
+    The remaining ``d_sae - n_dirs`` features are free and behave like standard
+    BatchTopK features.
+
+    All features compete in the same global top-k selection, so a pinned feature
+    fires only when the input has meaningful signal along its fixed direction —
+    it is not forced to be always active.
+
+    Args:
+        d_in: input (model activation) dimension
+        d_sae: total number of SAE features; must be strictly greater than n_dirs
+        k: number of features kept active per sample (top-k sparsity)
+        directions: ``[n_dirs, d_in]`` array — the concept directions to pin
+            (e.g. PCA axes). They will be L2-normalised internally.
+        device: optional torch device
+        dtype: parameter dtype (default float32)
+    """
+    def __init__(self, d_in, d_sae, k, directions, device=None, dtype=torch.float32):
+        super().__init__()
+        self.d_in = d_in
+        self.d_sae = d_sae
+        self.k = int(k)
+
+        # Normalise the provided directions to unit norm so that each pinned
+        # feature's decoder direction has the same scale as a standard SAE atom.
+        dirs = F.normalize(
+            torch.as_tensor(directions, dtype=dtype), dim=1
+        )  # [n_dirs, d_in]
+        n_dirs = dirs.shape[0]
+        if not (0 < n_dirs < d_sae):
+            raise ValueError(
+                f"n_dirs={n_dirs} must satisfy 0 < n_dirs < d_sae={d_sae}"
+            )
+        self.n_dirs = n_dirs
+
+        # ── Encoder ──────────────────────────────────────────────────────────
+        # A single unconstrained linear map: all d_sae features (pinned and free)
+        # are encoded from the full d_in activation. The pinned decoder directions
+        # don't restrict what the encoder can learn, but warm-starting rows 0..n_dirs-1
+        # to the concept directions gives those features a head-start: at
+        # initialisation, feature i computes the projection of x onto direction i.
+        self.encoder = nn.Linear(d_in, d_sae)
+        with torch.no_grad():
+            # Overwrite the first n_dirs encoder rows with the pinned directions.
+            # The remaining rows keep the default kaiming_uniform_ initialisation.
+            self.encoder.weight[:n_dirs] = dirs  # [n_dirs, d_in]
+
+        # ── Decoder ──────────────────────────────────────────────────────────
+        # Pinned directions are registered as a buffer so they are:
+        #   - saved and restored by state_dict (checkpoint round-trips correctly)
+        #   - NOT treated as nn.Parameter, so the optimiser never touches them
+        self.register_buffer('pinned_directions', dirs)  # [n_dirs, d_in]
+
+        # The free decoder weights for the remaining d_sae - n_dirs features are
+        # a standard trainable Parameter of shape [d_sae - n_dirs, d_in].
+        self.free_decoder = nn.Parameter(
+            torch.empty(d_sae - n_dirs, d_in, dtype=dtype)
+        )
+        nn.init.kaiming_uniform_(self.free_decoder)
+
+        if device is not None or dtype is not None:
+            self.to(device=device, dtype=dtype)
+
+    def _full_decoder_weight(self):
+        """Assemble the full ``[d_sae, d_in]`` decoder weight matrix on the fly.
+
+        Row i is the decoder direction for feature i. Pinned rows (0..n_dirs-1)
+        come first; free rows (n_dirs..d_sae-1) follow. The cat is cheap — it
+        just creates a view, so there is no meaningful runtime overhead.
+        """
+        return torch.cat([
+            self.pinned_directions,  # [n_dirs, d_in] — fixed buffer, never updated
+            self.free_decoder,       # [d_sae - n_dirs, d_in] — trained parameter
+        ], dim=0)
+
+    def encode(self, x):
+        """Sparse-encode ``x`` ``[N, d_in]`` → codes ``[N, d_sae]``."""
+        # All d_sae features (pinned and free) compete for the k active slots.
+        pre = F.relu(self.encoder(x))
+        top = pre.topk(self.k, dim=-1)
+        z = torch.zeros_like(pre)
+        z.scatter_(-1, top.indices, top.values)
+        return z
+
+    def decode(self, z):
+        """Reconstruct from sparse codes ``z`` ``[N, d_sae]`` → ``[N, d_in]``."""
+        # Each active code z_i contributes z_i * (row i of decoder) to the output.
+        # For pinned features this is z_i * fixed_direction_i, so pinned features
+        # can only reconstruct signal along their assigned concept direction.
+        return z @ self._full_decoder_weight()
+
+    def forward(self, x):
+        z = self.encode(x)
+        return self.decode(z), z
+
+
 def load_sae(path, d_in=4096, d_sae=None, k=None, expansion_factor=None,
              device=None, dtype=torch.float32):
     """Load an SAE checkpoint of any supported type.
 
     Accepts either a raw ``state_dict`` or a dict with ``state_dict`` and
     ``model_config`` keys. The config may carry ``sae_type`` (one of
-    ``batchtopk``, ``gated``, ``jumprelu``, ``matryoshka``) plus the usual
-    architecture parameters.
+    ``batchtopk``, ``gated``, ``jumprelu``, ``matryoshka``, ``subspace``) plus
+    the usual architecture parameters.
 
     Args:
         path: path to the checkpoint
@@ -234,6 +334,25 @@ def load_sae(path, d_in=4096, d_sae=None, k=None, expansion_factor=None,
         if ks is None:
             ks = [max(1, k // 4), k // 2, k] if k else [16, 32, 64]
         sae = MatryoshkaSAE(d_in=d_in, d_sae=d_sae, ks=ks, device=device, dtype=dtype)
+    elif sae_type == "subspace":
+        if k is None:
+            raise ValueError("Could not infer k; pass k=...")
+        # n_dirs is stored in model_config. The actual direction vectors live in
+        # state_dict["pinned_directions"] and will be restored by load_state_dict
+        # below — so we only need the shape here to construct the model.
+        n_dirs = cfg.get("n_dirs") if (isinstance(ckpt, dict) and "state_dict" in ckpt) else None
+        if n_dirs is None and "pinned_directions" in state_dict:
+            n_dirs = state_dict["pinned_directions"].shape[0]
+        if n_dirs is None:
+            raise ValueError(
+                "Could not infer n_dirs for SubspaceSAE; "
+                "checkpoint model_config must contain 'n_dirs'."
+            )
+        # Use placeholder directions of the right shape; load_state_dict will
+        # overwrite pinned_directions with the saved values.
+        dummy_dirs = torch.zeros(n_dirs, d_in)
+        sae = SubspaceSAE(d_in=d_in, d_sae=d_sae, k=k,
+                          directions=dummy_dirs, device=device, dtype=dtype)
     else:
         if k is None:
             raise ValueError("Could not infer k; pass k=...")
@@ -269,6 +388,10 @@ def encode_sae(sae, activations, device=None):
 
 def get_decoder(sae):
     """Return the decoder weight as a ``[d_sae, d_in]`` numpy array."""
+    if isinstance(sae, SubspaceSAE):
+        # SubspaceSAE has no single decoder Linear; assemble the full matrix
+        # from the pinned buffer and the free parameter.
+        return sae._full_decoder_weight().detach().float().cpu().numpy()
     W = sae.decoder.weight.detach().float().cpu()
     # nn.Linear stores [out, in] = [d_in, d_sae]. Transpose to [d_sae, d_in].
     if W.shape[0] == sae.d_sae:

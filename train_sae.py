@@ -23,7 +23,7 @@ from torch import nn
 from torch.utils.data import DataLoader, TensorDataset, random_split
 
 from data import CACHE_DIR, get_all_manifold_names, load_manifold_data
-from saes import BatchTopKSAE, GatedSAE, JumpReLUSAE, MatryoshkaSAE
+from saes import BatchTopKSAE, GatedSAE, JumpReLUSAE, MatryoshkaSAE, SubspaceSAE
 
 
 def _load_training_activations(manifolds, filter_outliers=True, n_std=3.0):
@@ -66,7 +66,7 @@ def _make_loaders(activations, batch_size, val_fraction, seed):
     return train_loader, val_loader
 
 
-def _init_model(sae_type, d_in, d_sae, k, ks, device, dtype):
+def _init_model(sae_type, d_in, d_sae, k, ks, device, dtype, directions=None):
     if sae_type == "gated":
         model = GatedSAE(d_in=d_in, d_sae=d_sae, device=device, dtype=dtype)
     elif sae_type == "jumprelu":
@@ -75,8 +75,20 @@ def _init_model(sae_type, d_in, d_sae, k, ks, device, dtype):
         if ks is None:
             ks = [max(1, k // 4), k // 2, k]
         model = MatryoshkaSAE(d_in=d_in, d_sae=d_sae, ks=ks, device=device, dtype=dtype)
+    elif sae_type == "subspace":
+        # directions is a [n_dirs, d_in] array whose rows become the fixed decoder
+        # directions for the first n_dirs features.
+        if directions is None:
+            raise ValueError(
+                "sae_type='subspace' requires directions. "
+                "Pass --directions <file> or --directions-manifold <name>."
+            )
+        model = SubspaceSAE(d_in=d_in, d_sae=d_sae, k=k,
+                            directions=directions, device=device, dtype=dtype)
     else:
         model = BatchTopKSAE(d_in=d_in, d_sae=d_sae, k=k, device=device, dtype=dtype)
+    # Zero all Linear biases at init; encoder bias is the only one for SubspaceSAE
+    # (free_decoder is an nn.Parameter, not nn.Linear, so it is unaffected).
     for m in model.modules():
         if isinstance(m, nn.Linear) and m.bias is not None:
             nn.init.zeros_(m.bias)
@@ -161,6 +173,7 @@ def train_sae(
     dtype=torch.float32,
     filter_outliers=True,
     n_std=3.0,
+    directions=None,
 ):
     torch.manual_seed(seed)
     np.random.seed(seed)
@@ -177,13 +190,17 @@ def train_sae(
 
     train_loader, val_loader = _make_loaders(activations, batch_size, val_fraction, seed)
     model = _init_model(sae_type=sae_type, d_in=d_in, d_sae=d_sae, k=k,
-                        ks=matryoshka_ks, device=device, dtype=dtype)
+                        ks=matryoshka_ks, device=device, dtype=dtype,
+                        directions=directions)
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
 
     ks_actual = model.ks if isinstance(model, MatryoshkaSAE) else None
+    # For SubspaceSAE, also show how many features are pinned vs free.
+    n_dirs_str = (f", n_dirs={model.n_dirs}" if isinstance(model, SubspaceSAE) else "")
     print(f"Training on manifolds: {', '.join(selected_manifolds)}")
     print(f"Activations: {tuple(activations.shape)}")
     print(f"SAE type: {sae_type} | d_in={d_in}, d_sae={d_sae}, k={k}"
+          + n_dirs_str
           + (f", ks={ks_actual}" if ks_actual else "")
           + (f", l1={l1_weight}" if l1_weight > 0 else "")
           + f" | device={device}, dtype={dtype}")
@@ -232,6 +249,10 @@ def train_sae(
             "manifolds": selected_manifolds,
             "filter_outliers": filter_outliers,
             "n_std": n_std,
+            # SubspaceSAE: store n_dirs so load_sae can reconstruct the model shape.
+            # The actual direction vectors are already in state_dict["pinned_directions"]
+            # (saved as a buffer), so this is just a convenience for load_sae.
+            **({"n_dirs": model.n_dirs} if isinstance(model, SubspaceSAE) else {}),
         },
         "training_config": {
             "batch_size": batch_size,
@@ -251,7 +272,7 @@ def train_sae(
     return output_path
 
 
-_ALL_SAE_TYPES = ["batchtopk", "gated", "jumprelu", "matryoshka"]
+_ALL_SAE_TYPES = ["batchtopk", "gated", "jumprelu", "matryoshka", "subspace"]
 _L1_DEFAULTS = {"gated": 1e-3, "jumprelu": 1e-3}
 
 
@@ -275,8 +296,40 @@ def main():
         default=_ALL_SAE_TYPES,
         metavar="TYPE",
         help=(
-            "One or more SAE types to train: batchtopk gated jumprelu matryoshka. "
-            "Default: all four."
+            "One or more SAE types to train: "
+            "batchtopk gated jumprelu matryoshka subspace. "
+            "Default: all five."
+        ),
+    )
+    parser.add_argument(
+        "--directions",
+        type=str,
+        default=None,
+        metavar="PATH",
+        help=(
+            "Path to a .npy or .pt file containing an [n_dirs, d_in] array of "
+            "concept directions for the subspace SAE type. "
+            "Mutually exclusive with --directions-manifold."
+        ),
+    )
+    parser.add_argument(
+        "--directions-manifold",
+        type=str,
+        default=None,
+        metavar="NAME",
+        help=(
+            "Compute PCA directions from this manifold's cached activations and "
+            "use them as the subspace SAE's pinned directions. "
+            "Mutually exclusive with --directions."
+        ),
+    )
+    parser.add_argument(
+        "--directions-n-components",
+        type=int,
+        default=5,
+        help=(
+            "Number of PCA components to extract when using --directions-manifold "
+            "(default: 5)."
         ),
     )
     parser.add_argument(
@@ -346,6 +399,41 @@ def main():
     if unknown:
         parser.error(f"Unknown SAE type(s): {unknown}. Choose from {_ALL_SAE_TYPES}")
 
+    # ── Resolve directions for SubspaceSAE ───────────────────────────────────
+    # directions is only needed (and validated) when subspace is in the type list.
+    directions = None
+    if "subspace" in args.sae_type:
+        if args.directions is not None and args.directions_manifold is not None:
+            parser.error("Pass --directions or --directions-manifold, not both.")
+        elif args.directions is not None:
+            # Load a pre-computed directions array from a file.
+            p = Path(args.directions)
+            if p.suffix == ".npy":
+                directions = np.load(p)
+            else:
+                # Accept a raw tensor or a dict containing a "directions" key.
+                obj = torch.load(p, map_location="cpu", weights_only=False)
+                directions = (obj.numpy() if isinstance(obj, torch.Tensor)
+                              else np.array(obj))
+            print(f"Loaded {directions.shape[0]} directions from {p}")
+        elif args.directions_manifold is not None:
+            # Compute PCA directions on the fly from a cached manifold.
+            from subspace_capture import get_manifold_pca_directions
+            directions, var_exp = get_manifold_pca_directions(
+                args.directions_manifold,
+                n_components=args.directions_n_components,
+            )
+            print(
+                f"PCA directions from '{args.directions_manifold}': "
+                f"{directions.shape[0]} components, "
+                f"variance explained = {[f'{v:.3f}' for v in var_exp]}"
+            )
+        else:
+            parser.error(
+                "--sae-type subspace requires --directions <file> or "
+                "--directions-manifold <name>."
+            )
+
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -373,6 +461,7 @@ def main():
             dtype=dtype,
             filter_outliers=not args.no_filter_outliers,
             n_std=args.n_std,
+            directions=directions,
         )
 
 

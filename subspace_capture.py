@@ -62,6 +62,66 @@ def _detect_elbow(curve, min_k=1):
     return int(np.argmax(dists))
 
 
+# ── Manifold PCA directions ──────────────────────────────────────────────────
+
+def get_manifold_pca_directions(manifold, n_components=5,
+                                filter_outliers=True, n_std=3.0):
+    """Return the top PCA directions of a concept manifold's activation cloud.
+
+    Args:
+        manifold: manifold name (e.g. ``'years'``, ``'colors'``, ``'temperature'``)
+        n_components: number of principal directions to return (typically 3–5)
+        filter_outliers: whether to drop activation-norm outliers before PCA
+        n_std: outlier cutoff in standard deviations (passed to load_manifold_data)
+
+    Returns:
+        directions: ``[n_components, d_model]`` float32 ndarray — unit-norm
+            principal directions, ordered by decreasing variance
+        variance_explained: ``[n_components]`` float32 ndarray — fraction of
+            total variance captured by each direction (sums ≤ 1)
+
+    Raises:
+        FileNotFoundError: if no cached activations exist for ``manifold``
+        ValueError: if ``manifold`` has too few samples for PCA
+    """
+    # Load cached activations (and labels) for the manifold, optionally
+    # dropping samples whose activation norm is an outlier (attention sinks).
+    data = load_manifold_data(manifold, filter_outliers=filter_outliers,
+                              n_std=n_std)
+    if data is None:
+        raise FileNotFoundError(
+            f"No cached activations for '{manifold}'. "
+            f"Run: uv run data.py --manifold {manifold}"
+        )
+
+    acts = data['activations']
+    # Convert to a plain float32 numpy array regardless of whether the cache
+    # stored a torch.Tensor or an ndarray.
+    acts_np = (acts.float().numpy() if isinstance(acts, torch.Tensor)
+               else np.asarray(acts, dtype=np.float32))
+
+    n_samples = acts_np.shape[0]
+    # Clamp n_components so PCA never requests more components than there are
+    # samples or dimensions — both would cause sklearn to error.
+    n_components = min(n_components, n_samples, acts_np.shape[1])
+    if n_samples < 2:
+        raise ValueError(
+            f"'{manifold}' has only {n_samples} sample(s); need ≥ 2 for PCA")
+
+    pca = PCA(n_components=n_components)
+    # fit() centers the data internally (subtracts the column mean), then
+    # finds the directions of maximum variance via a truncated SVD.
+    pca.fit(acts_np)
+
+    # components_ is [n_components, d_model]: each row is a unit-norm vector
+    # pointing along a principal axis, ordered by decreasing variance.
+    directions = pca.components_.astype(np.float32)
+    # explained_variance_ratio_ gives each component's share of total variance,
+    # so values sum to ≤ 1 (< 1 when n_components < rank of the data).
+    variance_explained = pca.explained_variance_ratio_.astype(np.float32)
+    return directions, variance_explained
+
+
 # ── Geometric reconstruction (decoder directions) ────────────────────────────
 
 def find_support_greedy(activations, decoder, max_k=100, var_threshold=0.95):
