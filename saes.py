@@ -123,7 +123,8 @@ class JumpReLUSAE(nn.Module):
 
     def encode(self, x):
         pre = F.relu(self.encoder(x))
-        return torch.where(pre > self.threshold, pre, torch.zeros_like(pre))
+        return torch.where(pre > self.threshold, pre, torch.zeros_like(pre)) # won't activations that are always below threshold get pruned during training?
+    
 
     def decode(self, z):
         return self.decoder(z)
