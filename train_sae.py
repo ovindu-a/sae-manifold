@@ -274,6 +274,7 @@ def train_sae(
 
 _ALL_SAE_TYPES = ["batchtopk", "gated", "jumprelu", "matryoshka", "subspace"]
 _L1_DEFAULTS = {"gated": 1e-3, "jumprelu": 1e-3}
+_DEFAULT_DIRECTIONS_FILE = CACHE_DIR / "default_directions.npy"
 
 
 def main():
@@ -309,7 +310,8 @@ def main():
         help=(
             "Path to a .npy or .pt file containing an [n_dirs, d_in] array of "
             "concept directions for the subspace SAE type. "
-            "Mutually exclusive with --directions-manifold."
+            "Mutually exclusive with --directions-manifold. "
+            f"If not specified, will use default file at {_DEFAULT_DIRECTIONS_FILE} if it exists."
         ),
     )
     parser.add_argument(
@@ -428,10 +430,16 @@ def main():
                 f"{directions.shape[0]} components, "
                 f"variance explained = {[f'{v:.3f}' for v in var_exp]}"
             )
+        elif _DEFAULT_DIRECTIONS_FILE.exists():
+            # Fall back to default directions file if it exists.
+            print(f"Using default directions file: {_DEFAULT_DIRECTIONS_FILE}")
+            directions = np.load(_DEFAULT_DIRECTIONS_FILE)
+            print(f"Loaded {directions.shape[0]} directions from default file")
         else:
             parser.error(
-                "--sae-type subspace requires --directions <file> or "
-                "--directions-manifold <name>."
+                "--sae-type subspace requires --directions <file>, "
+                "--directions-manifold <name>, or a default directions file at "
+                f"{_DEFAULT_DIRECTIONS_FILE}"
             )
 
     output_dir = Path(args.output_dir)
