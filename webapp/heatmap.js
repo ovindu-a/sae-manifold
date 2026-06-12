@@ -1,6 +1,11 @@
 // Heatmap visualization using Plotly.js
 
 function initializeHeatmap() {
+    // Add mode change listener
+    const modeSelect = document.getElementById('heatmap-mode');
+    if (modeSelect) {
+        modeSelect.addEventListener('change', updateHeatmap);
+    }
     updateHeatmap();
 }
 
@@ -10,13 +15,25 @@ function updateHeatmap() {
     const container = document.getElementById('heatmap');
     container.innerHTML = '<div class="loading">Loading heatmap...</div>';
 
-    // Process data into matrix format
-    const { matrix, features, manifolds, hoverText } = processHeatmapData(filteredData);
+    // Get heatmap mode
+    const mode = document.getElementById('heatmap-mode')?.value || 'features';
+
+    // Process data into matrix format based on mode
+    const processedData = mode === 'prompts'
+        ? processPromptHeatmapData(filteredData)
+        : processHeatmapData(filteredData);
+
+    if (!processedData) {
+        container.innerHTML = '<div class="loading">No data available for this mode. Try selecting a single manifold for prompt mode.</div>';
+        return;
+    }
+
+    const { matrix, features, xLabels, hoverText } = processedData;
 
     // Create plotly heatmap
     const trace = {
         z: matrix,
-        x: manifolds,
+        x: xLabels,
         y: features,
         type: 'heatmap',
         colorscale: [
@@ -42,17 +59,23 @@ function updateHeatmap() {
         }
     };
 
+    const xAxisTitle = mode === 'prompts' ? 'Prompts' : 'Manifolds';
+    const heatmapTitle = mode === 'prompts'
+        ? 'Feature × Prompt Activation Heatmap'
+        : 'Feature × Manifold Activation Heatmap';
+
     const layout = {
         title: {
-            text: 'Feature × Manifold Activation Heatmap',
+            text: heatmapTitle,
             font: { color: '#e6edf3', size: 16 }
         },
         xaxis: {
-            title: 'Manifolds',
+            title: xAxisTitle,
             tickangle: -45,
             side: 'bottom',
             color: '#e6edf3',
-            gridcolor: '#30363d'
+            gridcolor: '#30363d',
+            tickfont: { size: mode === 'prompts' ? 8 : 10 }
         },
         yaxis: {
             title: 'Features (SAE_Type_Index)',
@@ -165,7 +188,87 @@ function processHeatmapData(data) {
         hoverText.push(hoverRow);
     });
 
-    return { matrix, features, manifolds, hoverText };
+    return { matrix, features, xLabels: manifolds, hoverText };
+}
+
+function processPromptHeatmapData(data) {
+    // For prompt mode, we need a specific manifold selected
+    const manifoldFilter = document.getElementById('manifold-filter')?.value;
+
+    if (!manifoldFilter || manifoldFilter === 'all') {
+        return null; // Require a specific manifold for prompt mode
+    }
+
+    // Group by feature and prompt
+    const featurePromptMap = new Map();
+    const promptsSet = new Set();
+    const featuresSet = new Set();
+
+    data.rows.forEach(row => {
+        if (row.manifold_name !== manifoldFilter) return;
+
+        const featureId = `${row.sae_type}_${row.feature_idx}`;
+        const prompt = row.prompt;
+
+        promptsSet.add(prompt);
+        featuresSet.add(featureId);
+
+        const key = `${featureId}|${prompt}`;
+        if (!featurePromptMap.has(key)) {
+            featurePromptMap.set(key, {
+                activation: row.activation_value,
+                sae_type: row.sae_type,
+                feature_idx: row.feature_idx
+            });
+        } else {
+            // Keep max activation if multiple entries
+            const existing = featurePromptMap.get(key);
+            if (row.activation_value > existing.activation) {
+                existing.activation = row.activation_value;
+            }
+        }
+    });
+
+    // Sort features and prompts
+    const features = Array.from(featuresSet).sort();
+    const prompts = Array.from(promptsSet);
+
+    // Truncate prompt labels for display
+    const promptLabels = prompts.map(p => {
+        const maxLen = 40;
+        return p.length > maxLen ? p.substring(0, maxLen) + '...' : p;
+    });
+
+    // Build matrix
+    const matrix = [];
+    const hoverText = [];
+
+    features.forEach(feature => {
+        const row = [];
+        const hoverRow = [];
+
+        prompts.forEach(prompt => {
+            const key = `${feature}|${prompt}`;
+            const entry = featurePromptMap.get(key);
+
+            if (entry) {
+                row.push(entry.activation);
+                hoverRow.push(
+                    `<b>${feature}</b><br>` +
+                    `Activation: ${entry.activation.toFixed(3)}<br>` +
+                    `<br>Prompt:<br>${prompt}`
+                );
+            } else {
+                row.push(0);
+                hoverRow.push(`<b>${feature}</b><br>No activation<br><br>${prompt}`);
+            }
+        });
+
+        matrix.push(row);
+        hoverText.push(hoverRow);
+    });
+
+    return { matrix, features, xLabels: promptLabels, hoverText };
 }
 
 function showHeatmapDetail(feature, manifold) {

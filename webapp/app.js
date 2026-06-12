@@ -43,9 +43,13 @@ async function loadData() {
 }
 
 function populateFilters() {
+    // Default values
+    const DEFAULT_SAE = 'subspace';
+    const DEFAULT_MANIFOLD = 'days';
+
     // SAE types
     const saeFilter = document.getElementById('sae-filter');
-    const saeTypes = [...new Set(data.rows.map(r => r.sae_type))];
+    const saeTypes = [...new Set(data.rows.map(r => r.sae_type))].sort();
     saeTypes.forEach(type => {
         const option = document.createElement('option');
         option.value = type;
@@ -53,15 +57,28 @@ function populateFilters() {
         saeFilter.appendChild(option);
     });
 
+    // Set default SAE if available
+    if (saeTypes.includes(DEFAULT_SAE)) {
+        saeFilter.value = DEFAULT_SAE;
+    }
+
     // Manifolds
     const manifoldFilter = document.getElementById('manifold-filter');
-    const manifolds = [...new Set(data.rows.map(r => r.manifold_name))];
+    const manifolds = [...new Set(data.rows.map(r => r.manifold_name))].sort();
     manifolds.forEach(manifold => {
         const option = document.createElement('option');
         option.value = manifold;
         option.textContent = manifold;
         manifoldFilter.appendChild(option);
     });
+
+    // Set default manifold if available
+    if (manifolds.includes(DEFAULT_MANIFOLD)) {
+        manifoldFilter.value = DEFAULT_MANIFOLD;
+    }
+
+    // Apply the default filters
+    applyFilters();
 }
 
 function applyFilters() {

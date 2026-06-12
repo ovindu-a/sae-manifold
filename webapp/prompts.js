@@ -41,7 +41,10 @@ function initializePromptExplorer() {
 
         // Populate SAE types
         if (data) {
-            const saeTypes = [...new Set(data.rows.map(r => r.sae_type))];
+            const DEFAULT_SAE = 'subspace';
+            const DEFAULT_MANIFOLD = 'days';
+
+            const saeTypes = [...new Set(data.rows.map(r => r.sae_type))].sort();
             const saeFilter = document.getElementById('prompt-sae-filter');
             saeTypes.forEach(type => {
                 const option = document.createElement('option');
@@ -50,8 +53,13 @@ function initializePromptExplorer() {
                 saeFilter.appendChild(option);
             });
 
+            // Set default SAE if available
+            if (saeTypes.includes(DEFAULT_SAE)) {
+                saeFilter.value = DEFAULT_SAE;
+            }
+
             // Populate manifolds
-            const manifolds = [...new Set(data.rows.map(r => r.manifold_name))];
+            const manifolds = [...new Set(data.rows.map(r => r.manifold_name))].sort();
             const manifoldFilter = document.getElementById('prompt-manifold-filter');
             manifolds.forEach(manifold => {
                 const option = document.createElement('option');
@@ -59,6 +67,11 @@ function initializePromptExplorer() {
                 option.textContent = manifold;
                 manifoldFilter.appendChild(option);
             });
+
+            // Set default manifold if available
+            if (manifolds.includes(DEFAULT_MANIFOLD)) {
+                manifoldFilter.value = DEFAULT_MANIFOLD;
+            }
         }
 
         // Add event listeners
@@ -72,7 +85,7 @@ function initializePromptExplorer() {
 }
 
 function updatePromptExplorer() {
-    if (!filteredData) return;
+    if (!data) return;
 
     // Get filter values
     currentPromptFilters.saeType = document.getElementById('prompt-sae-filter')?.value || 'all';
@@ -81,9 +94,10 @@ function updatePromptExplorer() {
     const sortBy = document.getElementById('prompt-sort')?.value || 'activation';
 
     // Process data - group by prompt
+    // Use original data, not filteredData, for the prompt explorer
     const promptMap = new Map();
 
-    filteredData.rows.forEach(row => {
+    data.rows.forEach(row => {
         // Apply prompt-specific filters
         if (currentPromptFilters.saeType !== 'all' && row.sae_type !== currentPromptFilters.saeType) {
             return;
