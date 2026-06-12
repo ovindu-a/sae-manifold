@@ -296,6 +296,9 @@ def run_extraction(manifolds=None):
     for name in names:
         print(f"\n{name}")
         if name in MANIFOLDS:
+            if name == "sent_length":
+                print("  Skipping sent_length (too slow to extract with nnsight)")
+                continue
             extract_standard(name, model, tokenizer)
         else:
             print(f"  Unknown manifold: {name}")
