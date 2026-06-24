@@ -266,6 +266,29 @@
             color: #8b949e;
         }
 
+        .concept-tab-btn {
+            padding: 0.4rem 1rem;
+            border-radius: 6px;
+            border: 1px solid #30363d;
+            background: #0d1117;
+            color: #8b949e;
+            cursor: pointer;
+            font-size: 0.875rem;
+            transition: all 0.15s;
+        }
+
+        .concept-tab-btn:hover {
+            border-color: #58a6ff;
+            color: #58a6ff;
+        }
+
+        .concept-tab-btn.active {
+            background: #1c2128;
+            border-color: #58a6ff;
+            color: #58a6ff;
+            font-weight: 600;
+        }
+
         .error {
             background: #f85149;
             color: #fff;
@@ -311,6 +334,7 @@
         <div class="tab active" data-tab="network">Network Graph</div>
         <div class="tab" data-tab="heatmap">Heatmap</div>
         <div class="tab" data-tab="prompts">Prompt Explorer</div>
+        <div class="tab" data-tab="pca">3D Concept Space</div>
     </div>
 
     <div id="network-content" class="content active">
@@ -357,11 +381,33 @@
         <div class="prompt-grid" id="prompt-grid"></div>
     </div>
 
+    <div id="pca-content" class="content">
+        <div class="stats" id="pca-stats" style="display:none;">
+            <h3 id="pca-concept-title">Concept: —</h3>
+            <div class="stats-grid" id="pca-stats-grid"></div>
+        </div>
+
+        <div id="pca-concept-tabs" style="
+            display: flex;
+            flex-wrap: wrap;
+            gap: 0.5rem;
+            margin-bottom: 1rem;
+        "></div>
+
+        <div id="pca-plot" style="
+            background: #161b22;
+            border: 1px solid #30363d;
+            border-radius: 8px;
+            min-height: 600px;
+        "></div>
+    </div>
+
     <div class="tooltip" id="tooltip"></div>
 
     <script src="network.js"></script>
     <script src="heatmap.js"></script>
     <script src="prompts.js"></script>
+    <script src="pca_view.js"></script>
     <script src="app.js"></script>
 </body>
 </html>

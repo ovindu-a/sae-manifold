@@ -117,6 +117,8 @@ function updateStatistics() {
 }
 
 // Tab switching
+let pcaInitialized = false;
+
 document.querySelectorAll('.tab').forEach(tab => {
     tab.addEventListener('click', () => {
         const tabName = tab.dataset.tab;
@@ -132,6 +134,12 @@ document.querySelectorAll('.tab').forEach(tab => {
         // Trigger resize for plotly charts
         if (tabName === 'heatmap') {
             Plotly.Plots.resize('heatmap');
+        }
+
+        // Lazy-init the PCA view on first visit
+        if (tabName === 'pca' && !pcaInitialized) {
+            pcaInitialized = true;
+            initializePCAView();
         }
     });
 });
